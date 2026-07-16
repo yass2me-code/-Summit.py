@@ -1,0 +1,1136 @@
+from pathlib import Path
+import asyncio
+import os
+import sqlite3
+from datetime import datetime, timezone
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from dotenv import load_dotenv
+
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+load_dotenv()
+
+TOKEN = os.getenv("TOKEN")
+
+GUILD_ID = 1513745902978863166
+GUILD_OBJECT = discord.Object(id=GUILD_ID)
+
+
+# Permission roles
+
+PROMOTE_PERMISSION_ROLE_ID = 1524257043677057024
+INFRACTION_PERMISSION_ROLE_ID = 1524256733546156183
+
+
+# Database
+
+DATABASE_PATH = Path("promotions.db")
+_database_lock = asyncio.Lock()
+
+
+# Logs channels
+
+PROMOTION_LOG_CHANNEL_ID = 1522609990395756564
+INFRACTION_LOG_CHANNEL_ID = 1522609991448657990
+
+
+# Images
+
+PROMO_IMAGE_URL = (
+    "https://cdn.discordapp.com/attachments/"
+    "1515859206698172536/1524073083151847445/image.jpg"
+)
+
+INFRACTION_IMAGE_URL = (
+    "https://cdn.discordapp.com/attachments/"
+    "1515859206698172536/1524073083151847445/image.jpg"
+)
+# =========================================================
+# DATABASE
+# =========================================================
+
+def initialise_database():
+
+    with sqlite3.connect(DATABASE_PATH) as database:
+
+        # =========================
+        # PROMOTIONS
+        # =========================
+
+        database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS promotions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                promoted_user_id INTEGER NOT NULL,
+                promoter_user_id INTEGER NOT NULL,
+                role_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Active',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+
+        # =========================
+        # INFRACTIONS
+        # =========================
+
+        database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS infractions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                infracter_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                notes TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Active',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+
+        database.commit()
+
+
+
+# =========================================================
+# SAVE PROMOTION
+# =========================================================
+
+async def save_promotion(
+    *,
+    guild_id: int,
+    promoted_user_id: int,
+    promoter_user_id: int,
+    role_id: int,
+    reason: str,
+):
+
+    async with _database_lock:
+
+        with sqlite3.connect(DATABASE_PATH) as database:
+
+            cursor = database.execute(
+                """
+                INSERT INTO promotions (
+                    guild_id,
+                    promoted_user_id,
+                    promoter_user_id,
+                    role_id,
+                    reason,
+                    status,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    promoted_user_id,
+                    promoter_user_id,
+                    role_id,
+                    reason,
+                    "Active",
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+
+            database.commit()
+
+            return cursor.lastrowid
+
+
+
+# =========================================================
+# SAVE INFRACTION
+# =========================================================
+
+async def save_infraction(
+    *,
+    guild_id: int,
+    user_id: int,
+    infracter_id: int,
+    action: str,
+    reason: str,
+    notes: str,
+):
+
+    async with _database_lock:
+
+        with sqlite3.connect(DATABASE_PATH) as database:
+
+            cursor = database.execute(
+                """
+                INSERT INTO infractions (
+                    guild_id,
+                    user_id,
+                    infracter_id,
+                    action,
+                    reason,
+                    notes,
+                    status,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    user_id,
+                    infracter_id,
+                    action,
+                    reason,
+                    notes,
+                    "Active",
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+
+            database.commit()
+
+            return cursor.lastrowid
+# =========================================================
+# BOT
+# =========================================================
+
+class LARPBot(commands.Bot):
+
+    async def setup_hook(self):
+
+        initialise_database()
+
+        await self.tree.sync(
+            guild=GUILD_OBJECT
+        )
+
+
+intents = discord.Intents.default()
+
+intents.members = True
+intents.message_content = True
+
+
+bot = LARPBot(
+    command_prefix="!",
+    intents=intents,
+    allowed_mentions=discord.AllowedMentions(
+        users=True,
+        roles=True,
+        everyone=False,
+        replied_user=False,
+    ),
+)
+
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+async def send_error(
+    interaction: discord.Interaction,
+    message: str,
+):
+
+    if interaction.response.is_done():
+
+        await interaction.edit_original_response(
+            content=f"❌ {message}",
+            embed=None,
+        )
+
+    else:
+
+        await interaction.response.send_message(
+            f"❌ {message}",
+            ephemeral=True,
+        )
+
+
+
+def get_embed_colour(
+    role: discord.Role
+):
+
+    if role.colour.value == 0:
+
+        return discord.Colour.blurple()
+
+    return role.colour
+# =========================================================
+# PROMOTION EMBEDS
+# =========================================================
+
+def make_promotion_embed(
+    *,
+    member: discord.Member,
+    promoter: discord.Member,
+    role: discord.Role,
+    reason: str,
+    case_id: int,
+):
+
+    embed = discord.Embed(
+        title="Staff Promotion",
+        description=(
+            f"**Staff Member:** {member.mention}\n"
+            f"**New Rank:** {role.mention}\n"
+            f"**Reason:** {reason}\n"
+            f"**Case ID:** `{case_id}`\n\n"
+            f"Promoted by {promoter.mention}"
+        ),
+        colour=get_embed_colour(role),
+        timestamp=discord.utils.utcnow(),
+    )
+
+
+    embed.set_thumbnail(
+        url=member.display_avatar.url
+    )
+
+    embed.set_image(
+        url=PROMO_IMAGE_URL
+    )
+
+
+    return embed
+
+
+
+
+def make_promotion_dm_embed(
+    *,
+    member: discord.Member,
+    promoter: discord.Member,
+    role: discord.Role,
+    reason: str,
+    case_id: int,
+    guild: discord.Guild,
+):
+
+
+    embed = discord.Embed(
+        title="You Have Been Promoted!",
+        description=(
+            f"**Staff Member:** {member.mention}\n"
+            f"**New Rank:** {role.mention}\n"
+            f"**Reason:** {reason}\n"
+            f"**Case ID:** `{case_id}`\n\n"
+            f"Promoted by {promoter.mention}"
+        ),
+        colour=get_embed_colour(role),
+        timestamp=discord.utils.utcnow(),
+    )
+
+
+    embed.set_author(
+        name=guild.name,
+        icon_url=(
+            guild.icon.url
+            if guild.icon
+            else None
+        ),
+    )
+
+
+    embed.set_thumbnail(
+        url=member.display_avatar.url
+    )
+
+
+    embed.set_image(
+        url=PROMO_IMAGE_URL
+    )
+
+
+    return embed
+# =========================================================
+# /PROMOTE COMMAND
+# =========================================================
+
+@bot.tree.command(
+    name="promote",
+    description="Promote a staff member.",
+    guild=GUILD_OBJECT,
+)
+@app_commands.describe(
+    member="The member to promote",
+    role="The rank to give",
+    reason="Promotion reason",
+)
+@app_commands.guild_only()
+async def promote(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    role: discord.Role,
+    reason: str,
+):
+
+    guild = interaction.guild
+    promoter = interaction.user
+
+
+    if guild is None:
+        return
+
+
+    # Permission role
+
+    permission_role = guild.get_role(
+        PROMOTE_PERMISSION_ROLE_ID
+    )
+
+
+    if permission_role not in promoter.roles:
+
+        await send_error(
+            interaction,
+            "You do not have permission to use this command.",
+        )
+
+        return
+
+
+
+    if member.bot:
+
+        await send_error(
+            interaction,
+            "You cannot promote bots.",
+        )
+
+        return
+
+
+
+    if role >= guild.me.top_role:
+
+        await send_error(
+            interaction,
+            "I cannot give this role.",
+        )
+
+        return
+
+
+
+    await interaction.response.defer(
+        thinking=True
+    )
+
+
+
+    try:
+
+        await member.add_roles(
+            role,
+            reason=f"Promotion by {promoter}: {reason}",
+        )
+
+
+    except discord.Forbidden:
+
+        await send_error(
+            interaction,
+            "I cannot add this role.",
+        )
+
+        return
+
+
+
+    case_id = await save_promotion(
+        guild_id=guild.id,
+        promoted_user_id=member.id,
+        promoter_user_id=promoter.id,
+        role_id=role.id,
+        reason=reason,
+    )
+
+
+
+    embed = make_promotion_embed(
+        member=member,
+        promoter=promoter,
+        role=role,
+        reason=reason,
+        case_id=case_id,
+    )
+
+
+
+    # Send log
+
+    channel = guild.get_channel(
+        PROMOTION_LOG_CHANNEL_ID
+    )
+
+
+    if channel:
+
+        await channel.send(
+            content=member.mention,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(
+                users=True
+            ),
+        )
+
+
+
+    # DM
+
+    try:
+
+        dm_embed = make_promotion_dm_embed(
+            member=member,
+            promoter=promoter,
+            role=role,
+            reason=reason,
+            case_id=case_id,
+            guild=guild,
+        )
+
+
+        await member.send(
+            embed=dm_embed
+        )
+
+
+    except discord.Forbidden:
+
+        pass
+
+
+
+    # Command confirmation
+
+    await interaction.edit_original_response(
+        content=(
+            f":check: {member.mention} has been promoted "
+            f"to {role.mention}"
+        )
+    )
+# =========================================================
+# /VOIDPROMOTION COMMAND
+# =========================================================
+
+@bot.tree.command(
+    name="voidpromotion",
+    description="Void a promotion.",
+    guild=GUILD_OBJECT,
+)
+@app_commands.describe(
+    case_id="Promotion case ID",
+)
+@app_commands.guild_only()
+async def voidpromotion(
+    interaction: discord.Interaction,
+    case_id: int,
+):
+
+    guild = interaction.guild
+    user = interaction.user
+
+
+    if guild is None:
+        return
+
+
+
+    with sqlite3.connect(DATABASE_PATH) as database:
+
+        promotion = database.execute(
+            """
+            SELECT promoted_user_id, role_id, status
+            FROM promotions
+            WHERE id = ?
+            AND guild_id = ?
+            """,
+            (
+                case_id,
+                guild.id,
+            ),
+        ).fetchone()
+
+
+
+    if promotion is None:
+
+        await send_error(
+            interaction,
+            "Promotion case not found.",
+        )
+
+        return
+
+
+
+    if promotion[2] == "Voided":
+
+        await send_error(
+            interaction,
+            "This promotion is already voided.",
+        )
+
+        return
+
+
+
+    member = guild.get_member(
+        promotion[0]
+    )
+
+    role = guild.get_role(
+        promotion[1]
+    )
+
+
+
+    if member and role:
+
+        try:
+
+            await member.remove_roles(
+                role,
+                reason=f"Promotion #{case_id} voided by {user}",
+            )
+
+        except discord.Forbidden:
+
+            pass
+
+
+
+    with sqlite3.connect(DATABASE_PATH) as database:
+
+        database.execute(
+            """
+            UPDATE promotions
+            SET status = 'Voided'
+            WHERE id = ?
+            """,
+            (case_id,),
+        )
+
+        database.commit()
+
+
+
+    embed = discord.Embed(
+        title="Promotion Voided",
+        description=(
+            f"Promotion `{case_id}` has been "
+            f"voided by {user.mention}"
+        ),
+        colour=discord.Colour.blue(),
+        timestamp=discord.utils.utcnow(),
+    )
+
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+
+
+# =========================================================
+# /PROMOTION-LIST COMMAND
+# =========================================================
+
+@bot.tree.command(
+    name="promotion-list",
+    description="Show promotions of a user.",
+    guild=GUILD_OBJECT,
+)
+@app_commands.describe(
+    member="User to check",
+)
+@app_commands.guild_only()
+async def promotion_list(
+    interaction: discord.Interaction,
+    member: discord.Member,
+):
+
+    guild = interaction.guild
+
+
+    if guild is None:
+        return
+
+
+
+    with sqlite3.connect(DATABASE_PATH) as database:
+
+        promotions = database.execute(
+            """
+            SELECT
+                id,
+                role_id,
+                reason,
+                status,
+                created_at
+            FROM promotions
+            WHERE promoted_user_id = ?
+            AND guild_id = ?
+            ORDER BY id DESC
+            """,
+            (
+                member.id,
+                guild.id,
+            ),
+        ).fetchall()
+
+
+
+    if not promotions:
+
+        await interaction.response.send_message(
+            "No promotions found.",
+            ephemeral=True,
+        )
+
+        return
+
+
+
+    embed = discord.Embed(
+        title=f"Promotion History - {member}",
+        colour=discord.Colour.blue(),
+    )
+
+
+    for promo in promotions:
+
+        case_id, role_id, reason, status, date = promo
+
+        role = guild.get_role(role_id)
+
+
+        embed.add_field(
+            name=f"Promotion #{case_id}",
+            value=(
+                f"**Role:** {role.mention if role else 'Unknown'}\n"
+                f"**Reason:** {reason}\n"
+                f"**Status:** {status}\n"
+                f"**Date:** {date}"
+            ),
+            inline=False,
+        )
+
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+# =========================================================
+# /INFRACTION COMMAND
+# =========================================================
+
+@bot.tree.command(
+    name="infraction",
+    description="Give an infraction to a user.",
+    guild=GUILD_OBJECT,
+)
+@app_commands.describe(
+    member="User receiving the infraction",
+    action="Infraction type",
+    reason="Reason",
+    notes="Notes",
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="Verbal Warning", value="Verbal Warning"),
+        app_commands.Choice(name="Warning", value="Warning"),
+        app_commands.Choice(name="Strike", value="Strike"),
+        app_commands.Choice(name="Suspension", value="Suspension"),
+        app_commands.Choice(name="Termination", value="Termination"),
+        app_commands.Choice(name="Blacklist", value="Blacklist"),
+        app_commands.Choice(name="Retirement", value="Retirement"),
+    ]
+)
+@app_commands.guild_only()
+async def infraction(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    action: app_commands.Choice[str],
+    reason: str,
+    notes: str,
+):
+
+    guild = interaction.guild
+    staff = interaction.user
+
+
+    if guild is None:
+        return
+
+
+    permission_role = guild.get_role(
+        INFRACTION_PERMISSION_ROLE_ID
+    )
+
+
+    if permission_role not in staff.roles:
+
+        await send_error(
+            interaction,
+            "You do not have permission to use this command.",
+        )
+
+        return
+
+
+
+    await interaction.response.defer(
+        thinking=True
+    )
+
+
+
+    case_id = await save_infraction(
+        guild_id=guild.id,
+        user_id=member.id,
+        infracter_id=staff.id,
+        action=action.value,
+        reason=reason,
+        notes=notes,
+    )
+
+
+
+    embed = discord.Embed(
+        title="LARP Infraction",
+        description=(
+            f"**Staff Member:** {member.mention}\n"
+            f"**Action:** {action.value}\n"
+            f"**Reason:** {reason}\n"
+            f"**Notes:** {notes}\n"
+            f"**Case ID:** `{case_id}`\n"
+            f"**Infracted by:** {staff.mention}"
+        ),
+        colour=discord.Colour.red(),
+        timestamp=discord.utils.utcnow(),
+    )
+
+
+    embed.set_image(
+        url=INFRACTION_IMAGE_URL
+    )
+
+
+
+    # DM user
+
+    try:
+
+        await member.send(
+            embed=embed
+        )
+
+    except discord.Forbidden:
+
+        pass
+
+
+
+    # Send infraction log
+
+    channel = guild.get_channel(
+        INFRACTION_LOG_CHANNEL_ID
+    )
+
+
+    if channel:
+
+        await channel.send(
+            content=member.mention,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(
+                users=True
+            ),
+        )
+
+
+
+    # Confirmation
+
+    await interaction.edit_original_response(
+        content=(
+            f":check: {member.mention} has been "
+            f"infracted with {action.value}"
+        )
+    )
+# =========================================================
+# /VOID-INFRACTION COMMAND
+# =========================================================
+
+@bot.tree.command(
+    name="void-infraction",
+    description="Void an infraction.",
+    guild=GUILD_OBJECT,
+)
+@app_commands.describe(
+    case_id="Infraction case ID",
+)
+@app_commands.guild_only()
+async def void_infraction(
+    interaction: discord.Interaction,
+    case_id: int,
+):
+
+    guild = interaction.guild
+    user = interaction.user
+
+
+    if guild is None:
+        return
+
+
+
+    with sqlite3.connect(DATABASE_PATH) as database:
+
+        infraction_data = database.execute(
+            """
+            SELECT status
+            FROM infractions
+            WHERE id = ?
+            AND guild_id = ?
+            """,
+            (
+                case_id,
+                guild.id,
+            ),
+        ).fetchone()
+
+
+
+    if infraction_data is None:
+
+        await send_error(
+            interaction,
+            "Infraction case not found.",
+        )
+
+        return
+
+
+
+    if infraction_data[0] == "Voided":
+
+        await send_error(
+            interaction,
+            "This infraction is already voided.",
+        )
+
+        return
+
+
+
+    with sqlite3.connect(DATABASE_PATH) as database:
+
+        database.execute(
+            """
+            UPDATE infractions
+            SET status = 'Voided'
+            WHERE id = ?
+            """,
+            (case_id,),
+        )
+
+        database.commit()
+
+
+
+    embed = discord.Embed(
+        title="Infraction Voided",
+        description=(
+            f"Infraction `{case_id}` has been "
+            f"voided by {user.mention}"
+        ),
+        colour=discord.Colour.blue(),
+        timestamp=discord.utils.utcnow(),
+    )
+
+
+    embed.set_footer(
+        text=f"Case ID: {case_id}"
+    )
+
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+
+
+# =========================================================
+# /INFRACTION-LIST COMMAND
+# =========================================================
+
+@bot.tree.command(
+    name="infraction-list",
+    description="Show infractions of a user.",
+    guild=GUILD_OBJECT,
+)
+@app_commands.describe(
+    member="User to check",
+)
+@app_commands.guild_only()
+async def infraction_list(
+    interaction: discord.Interaction,
+    member: discord.Member,
+):
+
+    guild = interaction.guild
+
+
+    if guild is None:
+        return
+
+
+
+    with sqlite3.connect(DATABASE_PATH) as database:
+
+        infractions = database.execute(
+            """
+            SELECT
+                id,
+                action,
+                reason,
+                notes,
+                status,
+                created_at
+            FROM infractions
+            WHERE user_id = ?
+            AND guild_id = ?
+            ORDER BY id DESC
+            """,
+            (
+                member.id,
+                guild.id,
+            ),
+        ).fetchall()
+
+
+
+    if not infractions:
+
+        await interaction.response.send_message(
+            "No infractions found.",
+            ephemeral=True,
+        )
+
+        return
+
+
+
+    embed = discord.Embed(
+        title=f"Infraction History - {member}",
+        colour=discord.Colour.blue(),
+    )
+
+
+
+    for inf in infractions:
+
+        case_id, action, reason, notes, status, date = inf
+
+
+        embed.add_field(
+            name=f"Infraction #{case_id}",
+            value=(
+                f"**Action:** {action}\n"
+                f"**Reason:** {reason}\n"
+                f"**Notes:** {notes}\n"
+                f"**Status:** {status}\n"
+                f"**Date:** {date}"
+            ),
+            inline=False,
+        )
+
+
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+# =========================================================
+# /ROLE COMMAND
+# =========================================================
+
+@bot.tree.command(
+    name="role",
+    description="Add a role to a user.",
+    guild=GUILD_OBJECT,
+)
+@app_commands.describe(
+    member="User to give the role",
+    role="Role to add",
+)
+@app_commands.guild_only()
+async def role(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    role: discord.Role,
+):
+
+    if not interaction.user.guild_permissions.manage_roles:
+
+        await send_error(
+            interaction,
+            "You need Manage Roles permission.",
+        )
+
+        return
+
+
+
+    if role >= interaction.guild.me.top_role:
+
+        await send_error(
+            interaction,
+            "I cannot give this role.",
+        )
+
+        return
+
+
+
+    if role in member.roles:
+
+        await send_error(
+            interaction,
+            "This user already has this role.",
+        )
+
+        return
+
+
+
+    await member.add_roles(
+        role,
+        reason=f"Role added by {interaction.user}",
+    )
+
+
+    await interaction.response.send_message(
+        f":white_check_mark: I've successfully added the role "
+        f"{role.mention} to {member.mention}",
+        allowed_mentions=discord.AllowedMentions(
+            users=True,
+            roles=True,
+        ),
+    )
